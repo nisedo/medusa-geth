@@ -194,12 +194,32 @@ func isSystemCall(caller common.Address) bool {
 // the necessary steps to create accounts and reverses the state in case of an
 // execution error or failed value transfer.
 func (evm *EVM) Call(caller common.Address, addr common.Address, input []byte, gas uint64, value *uint256.Int) (ret []byte, leftOverGas uint64, err error) {
-	// Capture the tracer start/end events in debug mode
+	var (
+		snapshot      int
+		snapshotTaken bool
+	)
+	frameContext := CallFrameContext{
+		Depth:  evm.depth,
+		OpCode: CALL,
+		From:   caller,
+		To:     addr,
+		Input:  input,
+		Gas:    gas,
+	}
+	// Capture the tracer start event in debug mode.
 	if evm.Config.Tracer != nil {
-		evm.captureBegin(evm.depth, CALL, caller, addr, input, gas, value.ToBig())
-		defer func(startGas uint64) {
-			evm.captureEnd(evm.depth, startGas, leftOverGas, ret, err)
-		}(gas)
+		evm.captureBegin(frameContext.Depth, CALL, caller, addr, input, gas, value.ToBig())
+	}
+	// Finalize tracing and apply any Medusa result override after the raw call
+	// path has completed its normal rollback and gas handling.
+	if evm.Config.Tracer != nil || evm.hasCallFrameResultOverride() {
+		defer func() {
+			result := evm.finalizeCallFrame(frameContext, CallFrameResult{
+				Output: ret,
+				Err:    err,
+			}, leftOverGas, snapshot, snapshotTaken)
+			ret, err = result.Output, result.Err
+		}()
 	}
 	// Fail if we're trying to execute above the call depth limit
 	if evm.depth > int(params.CallCreateDepth) {
@@ -209,7 +229,8 @@ func (evm *EVM) Call(caller common.Address, addr common.Address, input []byte, g
 	if !value.IsZero() && !evm.Context.CanTransfer(evm.StateDB, caller, value) {
 		return nil, gas, ErrInsufficientBalance
 	}
-	snapshot := evm.StateDB.Snapshot()
+	snapshot = evm.StateDB.Snapshot()
+	snapshotTaken = true
 	p, isPrecompile := evm.precompile(addr)
 
 	if !evm.StateDB.Exist(addr) {
@@ -274,12 +295,30 @@ func (evm *EVM) Call(caller common.Address, addr common.Address, input []byte, g
 // CallCode differs from Call in the sense that it executes the given address'
 // code with the caller as context.
 func (evm *EVM) CallCode(caller common.Address, addr common.Address, input []byte, gas uint64, value *uint256.Int) (ret []byte, leftOverGas uint64, err error) {
-	// Invoke tracer hooks that signal entering/exiting a call frame
+	var (
+		snapshot      int
+		snapshotTaken bool
+	)
+	frameContext := CallFrameContext{
+		Depth:  evm.depth,
+		OpCode: CALLCODE,
+		From:   caller,
+		To:     addr,
+		Input:  input,
+		Gas:    gas,
+	}
+	// Invoke the tracer hook that signals entering a call frame.
 	if evm.Config.Tracer != nil {
-		evm.captureBegin(evm.depth, CALLCODE, caller, addr, input, gas, value.ToBig())
-		defer func(startGas uint64) {
-			evm.captureEnd(evm.depth, startGas, leftOverGas, ret, err)
-		}(gas)
+		evm.captureBegin(frameContext.Depth, CALLCODE, caller, addr, input, gas, value.ToBig())
+	}
+	if evm.Config.Tracer != nil || evm.hasCallFrameResultOverride() {
+		defer func() {
+			result := evm.finalizeCallFrame(frameContext, CallFrameResult{
+				Output: ret,
+				Err:    err,
+			}, leftOverGas, snapshot, snapshotTaken)
+			ret, err = result.Output, result.Err
+		}()
 	}
 	// Fail if we're trying to execute above the call depth limit
 	if evm.depth > int(params.CallCreateDepth) {
@@ -292,7 +331,8 @@ func (evm *EVM) CallCode(caller common.Address, addr common.Address, input []byt
 	if !evm.Context.CanTransfer(evm.StateDB, caller, value) {
 		return nil, gas, ErrInsufficientBalance
 	}
-	var snapshot = evm.StateDB.Snapshot()
+	snapshot = evm.StateDB.Snapshot()
+	snapshotTaken = true
 
 	// It is allowed to call precompiles, even via delegatecall
 	if p, isPrecompile := evm.precompile(addr); isPrecompile {
@@ -323,19 +363,38 @@ func (evm *EVM) CallCode(caller common.Address, addr common.Address, input []byt
 // DelegateCall differs from CallCode in the sense that it executes the given address'
 // code with the caller as context and the caller is set to the caller of the caller.
 func (evm *EVM) DelegateCall(originCaller common.Address, caller common.Address, addr common.Address, input []byte, gas uint64, value *uint256.Int) (ret []byte, leftOverGas uint64, err error) {
-	// Invoke tracer hooks that signal entering/exiting a call frame
+	var (
+		snapshot      int
+		snapshotTaken bool
+	)
+	frameContext := CallFrameContext{
+		Depth:  evm.depth,
+		OpCode: DELEGATECALL,
+		From:   caller,
+		To:     addr,
+		Input:  input,
+		Gas:    gas,
+	}
+	// Invoke the tracer hook that signals entering a call frame.
 	if evm.Config.Tracer != nil {
 		// DELEGATECALL inherits value from parent call
-		evm.captureBegin(evm.depth, DELEGATECALL, caller, addr, input, gas, value.ToBig())
-		defer func(startGas uint64) {
-			evm.captureEnd(evm.depth, startGas, leftOverGas, ret, err)
-		}(gas)
+		evm.captureBegin(frameContext.Depth, DELEGATECALL, caller, addr, input, gas, value.ToBig())
+	}
+	if evm.Config.Tracer != nil || evm.hasCallFrameResultOverride() {
+		defer func() {
+			result := evm.finalizeCallFrame(frameContext, CallFrameResult{
+				Output: ret,
+				Err:    err,
+			}, leftOverGas, snapshot, snapshotTaken)
+			ret, err = result.Output, result.Err
+		}()
 	}
 	// Fail if we're trying to execute above the call depth limit
 	if evm.depth > int(params.CallCreateDepth) {
 		return nil, gas, ErrDepth
 	}
-	var snapshot = evm.StateDB.Snapshot()
+	snapshot = evm.StateDB.Snapshot()
+	snapshotTaken = true
 
 	// It is allowed to call precompiles, even via delegatecall
 	if p, isPrecompile := evm.precompile(addr); isPrecompile {
@@ -366,12 +425,30 @@ func (evm *EVM) DelegateCall(originCaller common.Address, caller common.Address,
 // Opcodes that attempt to perform such modifications will result in exceptions
 // instead of performing the modifications.
 func (evm *EVM) StaticCall(caller common.Address, addr common.Address, input []byte, gas uint64) (ret []byte, leftOverGas uint64, err error) {
-	// Invoke tracer hooks that signal entering/exiting a call frame
+	var (
+		snapshot      int
+		snapshotTaken bool
+	)
+	frameContext := CallFrameContext{
+		Depth:  evm.depth,
+		OpCode: STATICCALL,
+		From:   caller,
+		To:     addr,
+		Input:  input,
+		Gas:    gas,
+	}
+	// Invoke the tracer hook that signals entering a call frame.
 	if evm.Config.Tracer != nil {
-		evm.captureBegin(evm.depth, STATICCALL, caller, addr, input, gas, nil)
-		defer func(startGas uint64) {
-			evm.captureEnd(evm.depth, startGas, leftOverGas, ret, err)
-		}(gas)
+		evm.captureBegin(frameContext.Depth, STATICCALL, caller, addr, input, gas, nil)
+	}
+	if evm.Config.Tracer != nil || evm.hasCallFrameResultOverride() {
+		defer func() {
+			result := evm.finalizeCallFrame(frameContext, CallFrameResult{
+				Output: ret,
+				Err:    err,
+			}, leftOverGas, snapshot, snapshotTaken)
+			ret, err = result.Output, result.Err
+		}()
 	}
 	// Fail if we're trying to execute above the call depth limit
 	if evm.depth > int(params.CallCreateDepth) {
@@ -382,7 +459,8 @@ func (evm *EVM) StaticCall(caller common.Address, addr common.Address, input []b
 	// after all empty accounts were deleted, so this is not required. However, if we omit this,
 	// then certain tests start failing; stRevertTest/RevertPrecompiledTouchExactOOG.json.
 	// We could change this, but for now it's left for legacy reasons
-	var snapshot = evm.StateDB.Snapshot()
+	snapshot = evm.StateDB.Snapshot()
+	snapshotTaken = true
 
 	// We do an AddBalance of zero here, just in order to trigger a touch.
 	// This doesn't matter on Mainnet, where all empties are gone at the time of Byzantium,
@@ -419,11 +497,30 @@ func (evm *EVM) StaticCall(caller common.Address, addr common.Address, input []b
 
 // create creates a new contract using code as deployment code.
 func (evm *EVM) create(caller common.Address, code []byte, gas uint64, value *uint256.Int, address common.Address, typ OpCode) (ret []byte, createAddress common.Address, leftOverGas uint64, err error) {
+	var (
+		snapshot      int
+		snapshotTaken bool
+	)
+	frameContext := CallFrameContext{
+		Depth:  evm.depth,
+		OpCode: typ,
+		From:   caller,
+		To:     address,
+		Input:  code,
+		Gas:    gas,
+	}
 	if evm.Config.Tracer != nil {
-		evm.captureBegin(evm.depth, typ, caller, address, code, gas, value.ToBig())
-		defer func(startGas uint64) {
-			evm.captureEnd(evm.depth, startGas, leftOverGas, ret, err)
-		}(gas)
+		evm.captureBegin(frameContext.Depth, typ, caller, address, code, gas, value.ToBig())
+	}
+	if evm.Config.Tracer != nil || evm.hasCallFrameResultOverride() {
+		defer func() {
+			result := evm.finalizeCallFrame(frameContext, CallFrameResult{
+				Output:        ret,
+				CreateAddress: createAddress,
+				Err:           err,
+			}, leftOverGas, snapshot, snapshotTaken)
+			ret, createAddress, err = result.Output, result.CreateAddress, result.Err
+		}()
 	}
 	// Depth check execution. Fail if we're trying to execute above the
 	// limit.
@@ -474,7 +571,8 @@ func (evm *EVM) create(caller common.Address, code []byte, gas uint64, value *ui
 	// Create a new account on the state only if the object was not present.
 	// It might be possible the contract code is deployed to a pre-existent
 	// account with non-zero balance.
-	snapshot := evm.StateDB.Snapshot()
+	snapshot = evm.StateDB.Snapshot()
+	snapshotTaken = true
 	if !evm.StateDB.Exist(address) {
 		evm.StateDB.CreateAccount(address)
 	}
@@ -491,6 +589,7 @@ func (evm *EVM) create(caller common.Address, code []byte, gas uint64, value *ui
 	if evm.chainRules.IsEIP4762 {
 		statelessGas := evm.AccessEvents.ContractCreateInitGas(address)
 		if statelessGas > gas {
+			evm.StateDB.RevertToSnapshot(snapshot)
 			return nil, common.Address{}, 0, ErrOutOfGas
 		}
 		if evm.Config.Tracer != nil && evm.Config.Tracer.OnGasChange != nil {
