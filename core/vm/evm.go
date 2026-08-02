@@ -137,6 +137,9 @@ type EVM struct {
 // state transition of a block, with the transaction context switched as
 // needed by calling evm.SetTxContext.
 func NewEVM(blockCtx BlockContext, statedb StateDB, chainConfig *params.ChainConfig, config Config) *EVM {
+	if config.ConfigExtensions == nil {
+		config.ConfigExtensions = new(ConfigExtensions)
+	}
 	evm := &EVM{
 		Context:     blockCtx,
 		StateDB:     statedb,
