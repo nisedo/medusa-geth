@@ -404,6 +404,171 @@ func TestCallFrameResultOverrideIsPresentedToCallingOpcode(t *testing.T) {
 	}
 }
 
+func TestCallCallerOverrideUsesCallerForValueSemantics(t *testing.T) {
+	const (
+		callValue          = uint64(7)
+		fundedBalance      = uint64(11)
+		initialSinkBalance = uint64(3)
+	)
+	outerAddress := common.HexToAddress("0x300")
+	actorAddress := common.HexToAddress("0xbeef")
+
+	tests := []struct {
+		name                string
+		callerOverride      bool
+		revertSink          bool
+		outerBalance        uint64
+		actorBalance        uint64
+		wantSuccess         uint64
+		wantOuterBalance    uint64
+		wantActorBalance    uint64
+		wantSinkBalance     uint64
+		wantStoredCaller    common.Address
+		wantStoredValue     uint64
+		wantTracedCaller    common.Address
+		wantOverrideMatches int
+	}{
+		{
+			name:             "nil override preserves ordinary caller and payer",
+			outerBalance:     fundedBalance,
+			wantSuccess:      1,
+			wantOuterBalance: fundedBalance - callValue,
+			wantSinkBalance:  initialSinkBalance + callValue,
+			wantStoredCaller: outerAddress,
+			wantStoredValue:  callValue,
+			wantTracedCaller: outerAddress,
+		},
+		{
+			name:                "empty actor fails despite funded outer contract",
+			callerOverride:      true,
+			outerBalance:        fundedBalance,
+			wantOuterBalance:    fundedBalance,
+			wantSinkBalance:     initialSinkBalance,
+			wantTracedCaller:    actorAddress,
+			wantOverrideMatches: 1,
+		},
+		{
+			name:                "funded actor pays despite empty outer contract",
+			callerOverride:      true,
+			actorBalance:        fundedBalance,
+			wantSuccess:         1,
+			wantActorBalance:    fundedBalance - callValue,
+			wantSinkBalance:     initialSinkBalance + callValue,
+			wantStoredCaller:    actorAddress,
+			wantStoredValue:     callValue,
+			wantTracedCaller:    actorAddress,
+			wantOverrideMatches: 1,
+		},
+		{
+			name:                "revert restores actor transfer and sink storage",
+			callerOverride:      true,
+			revertSink:          true,
+			actorBalance:        fundedBalance,
+			wantActorBalance:    fundedBalance,
+			wantSinkBalance:     initialSinkBalance,
+			wantTracedCaller:    actorAddress,
+			wantOverrideMatches: 1,
+		},
+	}
+
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			var tracedCaller common.Address
+			var tracedValue *big.Int
+			hooks := &tracing.Hooks{
+				OnEnter: func(depth int, _ byte, from common.Address, to common.Address, _ []byte, _ uint64, value *big.Int) {
+					if depth == 1 && to == callFrameTestTarget {
+						tracedCaller = from
+						tracedValue = new(big.Int).Set(value)
+					}
+				},
+			}
+			sinkCode := []byte{
+				byte(CALLER), byte(PUSH1), 0x00, byte(SSTORE),
+				byte(CALLVALUE), byte(PUSH1), 0x01, byte(SSTORE),
+			}
+			if test.revertSink {
+				sinkCode = append(sinkCode, byte(PUSH1), 0x00, byte(PUSH1), 0x00, byte(REVERT))
+			} else {
+				sinkCode = append(sinkCode, byte(STOP))
+			}
+
+			evm, stateDB := newCallFrameTestEVM(t, sinkCode, nil, hooks)
+			stateDB.CreateAccount(outerAddress)
+			stateDB.SetCode(outerAddress, callCallerOverrideOuterCode(callFrameTestTarget, byte(callValue)))
+			stateDB.SetBalance(outerAddress, uint256.NewInt(test.outerBalance), tracing.BalanceChangeUnspecified)
+			stateDB.CreateAccount(actorAddress)
+			stateDB.SetBalance(actorAddress, uint256.NewInt(test.actorBalance), tracing.BalanceChangeUnspecified)
+			stateDB.SetBalance(callFrameTestTarget, uint256.NewInt(initialSinkBalance), tracing.BalanceChangeUnspecified)
+			stateDB.Finalise(true)
+
+			overrideMatches := 0
+			if test.callerOverride {
+				evm.Config.CallCallerOverride = func(context CallCallerOverrideContext) common.Address {
+					if context.Depth == 1 && context.From == outerAddress && context.To == callFrameTestTarget {
+						overrideMatches++
+						return actorAddress
+					}
+					return context.From
+				}
+			}
+
+			output, _, err := evm.Call(callFrameTestCaller, outerAddress, nil, 3_000_000, new(uint256.Int))
+			if err != nil {
+				t.Fatalf("outer call failed: %v", err)
+			}
+			if len(output) != 32 {
+				t.Fatalf("outer output length mismatch: have %d, want 32", len(output))
+			}
+			if success := new(big.Int).SetBytes(output).Uint64(); success != test.wantSuccess {
+				t.Errorf("CALL success bit mismatch: have %d, want %d", success, test.wantSuccess)
+			}
+			if have := stateDB.GetBalance(outerAddress).Uint64(); have != test.wantOuterBalance {
+				t.Errorf("outer balance mismatch: have %d, want %d", have, test.wantOuterBalance)
+			}
+			if have := stateDB.GetBalance(actorAddress).Uint64(); have != test.wantActorBalance {
+				t.Errorf("actor balance mismatch: have %d, want %d", have, test.wantActorBalance)
+			}
+			if have := stateDB.GetBalance(callFrameTestTarget).Uint64(); have != test.wantSinkBalance {
+				t.Errorf("sink balance mismatch: have %d, want %d", have, test.wantSinkBalance)
+			}
+			if have := common.BytesToAddress(stateDB.GetState(callFrameTestTarget, common.Hash{}).Bytes()); have != test.wantStoredCaller {
+				t.Errorf("stored caller mismatch: have %s, want %s", have, test.wantStoredCaller)
+			}
+			if have := new(big.Int).SetBytes(stateDB.GetState(callFrameTestTarget, common.BigToHash(big.NewInt(1))).Bytes()).Uint64(); have != test.wantStoredValue {
+				t.Errorf("stored value mismatch: have %d, want %d", have, test.wantStoredValue)
+			}
+			if tracedCaller != test.wantTracedCaller {
+				t.Errorf("traced caller mismatch: have %s, want %s", tracedCaller, test.wantTracedCaller)
+			}
+			if tracedValue == nil || tracedValue.Uint64() != callValue {
+				t.Errorf("traced value mismatch: have %v, want %d", tracedValue, callValue)
+			}
+			if overrideMatches != test.wantOverrideMatches {
+				t.Errorf("override match count mismatch: have %d, want %d", overrideMatches, test.wantOverrideMatches)
+			}
+		})
+	}
+}
+
+func callCallerOverrideOuterCode(target common.Address, value byte) []byte {
+	code := []byte{
+		byte(PUSH1), 0x00, // output size
+		byte(PUSH1), 0x00, // output offset
+		byte(PUSH1), 0x00, // input size
+		byte(PUSH1), 0x00, // input offset
+		byte(PUSH1), value,
+		byte(PUSH20),
+	}
+	code = append(code, target.Bytes()...)
+	return append(code,
+		byte(PUSH3), 0x0f, 0x42, 0x40, // gas
+		byte(CALL),
+		byte(PUSH1), 0x00, byte(MSTORE),
+		byte(PUSH1), 0x20, byte(PUSH1), 0x00, byte(RETURN),
+	)
+}
+
 func TestCreateResultOverrideRollback(t *testing.T) {
 	t.Run("swallowed revert keeps raw rollback", func(t *testing.T) {
 		revertingInitCode := common.FromHex("0x600160005560006000fd")

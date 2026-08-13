@@ -43,6 +43,19 @@ type CallFrameResult struct {
 // actual creation failure as a success.
 type CallFrameResultOverrideFunc func(CallFrameContext, CallFrameResult) CallFrameResult
 
+// CallCallerOverrideContext identifies a CALL before its caller is used for
+// tracing, balance checks, value transfer, and child-frame construction.
+type CallCallerOverrideContext struct {
+	Depth int
+	From  common.Address
+	To    common.Address
+}
+
+// CallCallerOverrideFunc can replace the caller used by a CALL. The returned
+// address becomes both the child frame's caller and the source of any value
+// transfer.
+type CallCallerOverrideFunc func(CallCallerOverrideContext) common.Address
+
 // ConfigExtensions defines extended properties to be inherited by the Config.
 // Note: Ensure any values which are added here and were not set do not change default EVM behaviour.
 type ConfigExtensions struct {
@@ -64,6 +77,16 @@ type ConfigExtensions struct {
 	// Callbacks that capture mutable state must therefore be scoped to one chain
 	// or made safe for concurrent use.
 	CallFrameResultOverride CallFrameResultOverrideFunc
+
+	// CallCallerOverride can replace the caller used by CALL before tracing,
+	// account checks, value transfer, and child-frame creation. A nil callback
+	// preserves standard EVM behaviour. CALLCODE, DELEGATECALL, STATICCALL, and
+	// contract creation are not affected.
+	//
+	// ConfigExtensions is shared by EVMs constructed from the same Config.
+	// Callbacks that capture mutable state must therefore be scoped to one chain
+	// or made safe for concurrent use.
+	CallCallerOverride CallCallerOverrideFunc
 }
 
 func (evm *EVM) hasCallFrameResultOverride() bool {
